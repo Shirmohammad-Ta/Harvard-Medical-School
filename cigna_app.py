@@ -1,3 +1,7 @@
+"""
+CIGNA MA - In-Network Rates Dashboard
+Enhanced with Benchmark Comparison + Anomaly Detection
+"""
 
 import streamlit as st
 import pandas as pd
@@ -40,6 +44,7 @@ def load_all_descriptions():
         st.error(f"Error loading descriptions: {e}")
         return []
 
+@st.cache_data
 def get_code_info(billing_code):
     try:
         chunks = pd.read_csv('cigna_full_rates.csv', chunksize=50000)
@@ -70,12 +75,27 @@ def get_best_worst_providers(data, billing_code):
     """Get cheapest and most expensive providers for a code"""
     subset = data[data['billing_code'] == billing_code]
     if subset.empty:
-        return None, None
+        return None, None, 0
     
     provider_avg = subset.groupby('provider_name')['negotiated_rate'].mean().sort_values()
-    cheapest = provider_avg.head(3).to_dict()
-    most_expensive = provider_avg.tail(3).to_dict()
-    return cheapest, most_expensive
+    num_providers = len(provider_avg)
+    
+    if num_providers == 0:
+        return None, None, 0
+    elif num_providers <= 3:
+        cheapest = provider_avg.head(num_providers).to_dict()
+        most_expensive = {}
+    elif num_providers <= 6:
+        cheapest = provider_avg.head(3).to_dict()
+        most_expensive = {}
+        for provider, price in provider_avg.tail(3).items():
+            if provider not in cheapest:
+                most_expensive[provider] = price
+    else:
+        cheapest = provider_avg.head(3).to_dict()
+        most_expensive = provider_avg.tail(3).to_dict()
+    
+    return cheapest, most_expensive, num_providers
 
 def plot_compare_codes(data1, data2, code1, code2):
     """Compare two billing codes side by side"""
@@ -140,6 +160,16 @@ def plot_price_distribution(data, billing_code):
     plt.tight_layout()
     return fig
 
+def detect_anomalies(prices, threshold=2):
+    """Detect price anomalies using standard deviation"""
+    if len(prices) < 3:
+        return []
+    mean_price = prices.mean()
+    std_price = prices.std()
+    anomalies = prices[(prices > mean_price + threshold * std_price) | 
+                       (prices < mean_price - threshold * std_price)]
+    return anomalies.tolist()
+
 
 def main():
     st.title("🏥 CIGNA MA - In-Network Rates Dashboard")
@@ -150,54 +180,116 @@ def main():
         st.warning("⚠️ Please run the data extraction script first.")
         return
     
+    # محاسبه میانگین کل سیستم
+    overall_avg = summary['mean_rate'].mean() if summary is not None else 0
     
+    # Sidebar
     with st.sidebar:
         st.header("📊 Statistics")
         if summary is not None:
             st.metric("Total Rates", f"{summary['count'].sum():,}")
             st.metric("Unique Billing Codes", f"{len(summary):,}")
-            st.metric("Avg Rate", f"${summary['mean_rate'].mean():,.0f}")
+            st.metric("System Avg Rate", f"${overall_avg:,.0f}")
     
-    
+    # Tabs
     tab1, tab2, tab3, tab4 = st.tabs(["🔍 Search", "📊 Compare", "🏆 Top Codes", "💡 Best/Worst Providers"])
     
-    
+    # ============================================
+    # TAB 1: SEARCH (ENHANCED - MANUAL INPUT)
+    # ============================================
     with tab1:
         st.subheader("🔍 Search by Billing Code or Description")
         
         search_type = st.radio("Search by:", ["Billing Code", "Description"], horizontal=True)
         
         if search_type == "Billing Code":
-            search_code = st.selectbox("Select billing code", options=[''] + top_codes[:50])
+            st.markdown("### Enter a billing code manually")
             
-            if search_code:
-                with st.spinner(f"Loading {search_code}..."):
+            col1, col2 = st.columns([1, 2])
+            
+            with col1:
+                quick_select = st.selectbox(
+                    "⚡ Quick select (top 20 codes)", 
+                    options=[''] + top_codes[:20],
+                    help="Choose from the most common codes"
+                )
+            
+            with col2:
+                manual_code = st.text_input(
+                    "✏️ Or type any billing code manually",
+                    placeholder="Example: 76805, 99213, 99214",
+                    help="Enter any 5-digit CPT/HCPCS code"
+                )
+            
+            search_code = manual_code.strip() if manual_code else quick_select
+            
+            if search_code and search_code != '':
+                with st.spinner(f"Searching for code: {search_code}..."):
                     subset = get_code_info(search_code)
                 
                 if not subset.empty:
-                    st.success(f"✅ Found {len(subset)} records")
+                    st.success(f"✅ Found **{len(subset)}** records for code: `{search_code}`")
                     
                     prices = subset['negotiated_rate'].dropna()
+                    mean_price = prices.mean()
+                    median_price = prices.median()
+                    
+                    # ========================================
+                    # BENCHMARK COMPARISON
+                    # ========================================
+                    st.markdown("### 📊 Benchmark Analysis")
+                    col_bench1, col_bench2 = st.columns(2)
+                    
+                    with col_bench1:
+                        diff_percent = ((mean_price - overall_avg) / overall_avg) * 100
+                        if diff_percent > 0:
+                            st.warning(f"⚠️ This code is **{diff_percent:.1f}% MORE expensive** than system average (${overall_avg:,.0f})")
+                        else:
+                            st.success(f"✅ This code is **{abs(diff_percent):.1f}% CHEAPER** than system average (${overall_avg:,.0f})")
+                    
+                    with col_bench2:
+                        percentile_rank = (summary['mean_rate'] < mean_price).sum() / len(summary) * 100
+                        st.info(f"📈 This code is in the **{percentile_rank:.0f}th percentile** of all codes (higher = more expensive)")
+                    
+                    st.markdown("---")
+                    
+                    # ========================================
+                    # ANOMALY DETECTION
+                    # ========================================
+                    anomalies = detect_anomalies(prices)
+                    if anomalies:
+                        st.markdown("### 🚨 Price Anomaly Alert")
+                        for anomaly in anomalies[:5]:
+                            st.error(f"⚠️ Suspicious price detected: **${anomaly:,.0f}** (outlier)")
+                        if len(anomalies) > 5:
+                            st.caption(f"... and {len(anomalies) - 5} more anomalies")
+                        st.markdown("---")
+                    
+                    # Price statistics
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Count", f"{len(prices):,}")
-                    col2.metric("Mean", f"${prices.mean():,.0f}")
-                    col3.metric("Median", f"${prices.median():,.0f}")
+                    col2.metric("Mean", f"${mean_price:,.0f}")
+                    col3.metric("Median", f"${median_price:,.0f}")
                     col4.metric("Std", f"${prices.std():,.0f}")
                     
+                    # Price distribution plot
                     st.pyplot(plot_price_distribution(subset, search_code))
                     
-                    with st.expander("📊 Sample Data"):
-                        st.dataframe(subset[['provider_name', 'negotiated_rate', 'negotiated_type']].head(100))
+                    # Sample data
+                    with st.expander("📊 View Sample Data (first 100 rows)"):
+                        st.dataframe(subset[['provider_name', 'negotiated_rate', 'negotiated_type', 'description']].head(100))
                 else:
-                    st.warning(f"No data for {search_code}")
+                    st.error(f"❌ Code '{search_code}' not found in database")
+                    st.info(f"💡 Try one of these popular codes: `{', '.join(top_codes[:10])}`")
         
-        else:
+        else:  # Description search
             st.info("💡 Search by description to find the billing code")
             descriptions = load_all_descriptions()
             if descriptions:
                 search_desc = st.selectbox("Select description", options=[''] + descriptions[:100])
                 if search_desc:
-                    code = find_code_by_description(search_desc)
+                    with st.spinner("Searching..."):
+                        code = find_code_by_description(search_desc)
                     if code:
                         st.success(f"✅ Found code: **{code}**")
                         with st.spinner(f"Loading {code}..."):
@@ -207,20 +299,34 @@ def main():
                     else:
                         st.warning("No matching code found")
     
-    
+    # ============================================
+    # TAB 2: COMPARE
+    # ============================================
     with tab2:
         st.subheader("📊 Compare Two Billing Codes")
         
+        st.info("💡 You can also type custom codes (e.g., 76805, 99213)")
+        
         col1, col2 = st.columns(2)
+        
         with col1:
-            code1 = st.selectbox("First code", options=top_codes[:30], key='compare1')
+            code1_option = st.radio("Code 1 input method", ["Select from list", "Type manually"], key="code1_method")
+            if code1_option == "Select from list":
+                code1 = st.selectbox("First code", options=top_codes[:30], key='compare1_select')
+            else:
+                code1 = st.text_input("Enter first code", placeholder="Example: 76805", key='compare1_manual')
+        
         with col2:
-            code2 = st.selectbox("Second code", options=top_codes[:30], key='compare2')
+            code2_option = st.radio("Code 2 input method", ["Select from list", "Type manually"], key="code2_method")
+            if code2_option == "Select from list":
+                code2 = st.selectbox("Second code", options=top_codes[:30], key='compare2_select')
+            else:
+                code2 = st.text_input("Enter second code", placeholder="Example: 99213", key='compare2_manual')
         
         if code1 and code2:
             with st.spinner("Loading comparison data..."):
-                data1 = get_code_info(code1)
-                data2 = get_code_info(code2)
+                data1 = get_code_info(code1.strip())
+                data2 = get_code_info(code2.strip())
             
             if not data1.empty and not data2.empty:
                 st.pyplot(plot_compare_codes(data1, data2, code1, code2))
@@ -236,10 +342,16 @@ def main():
                     code2: [len(stats2), f"${stats2.mean():,.0f}", f"${stats2.median():,.0f}", f"${stats2.min():,.0f}", f"${stats2.max():,.0f}"]
                 })
                 st.dataframe(comp_df, use_container_width=True)
+            elif data1.empty:
+                st.error(f"❌ Code '{code1}' not found")
+            elif data2.empty:
+                st.error(f"❌ Code '{code2}' not found")
             else:
-                st.warning("Not enough data for comparison")
+                st.warning("No data for comparison")
     
-    
+    # ============================================
+    # TAB 3: TOP CODES
+    # ============================================
     with tab3:
         st.subheader("🏆 Top Billing Codes by Frequency")
         top_n = st.slider("Number to display", 5, 50, 20)
@@ -255,32 +367,48 @@ def main():
                 use_container_width=True
             )
     
-    
+    # ============================================
+    # TAB 4: BEST/WORST PROVIDERS
+    # ============================================
     with tab4:
         st.subheader("💡 Cheapest & Most Expensive Providers")
         
-        selected_code = st.selectbox("Select billing code", options=top_codes[:30], key='bw')
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            selected_code = st.selectbox("Select billing code", options=top_codes[:30], key='bw')
         
-        if selected_code:
+        with col2:
+            manual_bw_code = st.text_input("Or enter any code", placeholder="Example: 76805", key='bw_manual')
+        
+        final_code = manual_bw_code.strip() if manual_bw_code else selected_code
+        
+        if final_code:
             with st.spinner("Analyzing providers..."):
-                cheapest, expensive = get_best_worst_providers(get_code_info(selected_code), selected_code)
+                subset = get_code_info(final_code)
+                cheapest, expensive, num_providers = get_best_worst_providers(subset, final_code)
             
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("### 💚 Cheapest Providers")
-                if cheapest:
+            if cheapest:
+                st.success(f"Results for code: **{final_code}** (Found {num_providers} providers)")
+                
+                if num_providers < 6:
+                    st.info(f"ℹ️ Only {num_providers} provider(s) found for this code. Showing cheapest only.")
+                
+                col_a, col_b = st.columns(2)
+                
+                with col_a:
+                    st.markdown("### 💚 Cheapest Providers")
                     for provider, price in cheapest.items():
-                        st.metric(provider[:30], f"${price:,.0f}")
-                else:
-                    st.info("No data")
-            
-            with col2:
-                st.markdown("### 🔥 Most Expensive Providers")
-                if expensive:
-                    for provider, price in expensive.items():
-                        st.metric(provider[:30], f"${price:,.0f}")
-                else:
-                    st.info("No data")
+                        st.metric(provider[:40], f"${price:,.0f}")
+                
+                with col_b:
+                    st.markdown("### 🔥 Most Expensive Providers")
+                    if expensive:
+                        for provider, price in expensive.items():
+                            st.metric(provider[:40], f"${price:,.0f}")
+                    else:
+                        st.caption("✨ Same as cheapest (only 1-3 providers available)")
+            else:
+                st.error(f"❌ No data found for code: {final_code}")
 
 if __name__ == "__main__":
     main()
