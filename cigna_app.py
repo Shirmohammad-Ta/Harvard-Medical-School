@@ -1,6 +1,6 @@
 """
 CIGNA MA - In-Network Rates Dashboard
-Enhanced with Benchmark Comparison + Anomaly Detection
+Enhanced with Benchmark Comparison + Anomaly Detection + PDF Export
 """
 
 import streamlit as st
@@ -10,6 +10,13 @@ import seaborn as sns
 import numpy as np
 from matplotlib.ticker import FuncFormatter
 import io
+import base64
+import tempfile
+import os
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
 
 
 st.set_page_config(
@@ -170,6 +177,85 @@ def detect_anomalies(prices, threshold=2):
                        (prices < mean_price - threshold * std_price)]
     return anomalies.tolist()
 
+def create_pdf_report(code, stats, anomalies, cheapest, expensive, overall_avg):
+    """Create PDF report using reportlab"""
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    doc = SimpleDocTemplate(temp_file.name, pagesize=letter)
+    styles = getSampleStyleSheet()
+    
+    # Custom styles
+    title_style = ParagraphStyle(
+        'CustomTitle',
+        parent=styles['Heading1'],
+        fontSize=16,
+        alignment=1,
+        spaceAfter=20
+    )
+    
+    heading_style = ParagraphStyle(
+        'CustomHeading',
+        parent=styles['Heading2'],
+        fontSize=12,
+        spaceBefore=10,
+        spaceAfter=5
+    )
+    
+    normal_style = ParagraphStyle(
+        'CustomNormal',
+        parent=styles['Normal'],
+        fontSize=10,
+        spaceAfter=4
+    )
+    
+    story = []
+    
+    # Title
+    story.append(Paragraph(f"CIGNA MA Rate Report: Code {code}", title_style))
+    story.append(Spacer(1, 0.2*inch))
+    
+    # Basic Statistics
+    story.append(Paragraph("Basic Statistics", heading_style))
+    story.append(Paragraph(f"Total Records: {stats['count']:,}", normal_style))
+    story.append(Paragraph(f"Mean Price: ${stats['mean']:,.0f}", normal_style))
+    story.append(Paragraph(f"Median Price: ${stats['median']:,.0f}", normal_style))
+    story.append(Paragraph(f"Min Price: ${stats['min']:,.0f}", normal_style))
+    story.append(Paragraph(f"Max Price: ${stats['max']:,.0f}", normal_style))
+    story.append(Paragraph(f"Standard Deviation: ${stats['std']:,.0f}", normal_style))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # Benchmark
+    story.append(Paragraph("Benchmark Analysis", heading_style))
+    diff_percent = ((stats['mean'] - overall_avg) / overall_avg) * 100
+    story.append(Paragraph(f"System Average: ${overall_avg:,.0f}", normal_style))
+    story.append(Paragraph(f"Difference: {diff_percent:.1f}% {'above' if diff_percent > 0 else 'below'} average", normal_style))
+    story.append(Spacer(1, 0.1*inch))
+    
+    # Anomalies
+    if anomalies:
+        story.append(Paragraph("Price Anomalies Detected", heading_style))
+        for anomaly in anomalies[:10]:
+            story.append(Paragraph(f"Suspicious price: ${anomaly:,.0f}", normal_style))
+        story.append(Spacer(1, 0.1*inch))
+    
+    # Cheapest Providers
+    if cheapest:
+        story.append(Paragraph("Cheapest Providers", heading_style))
+        for provider, price in cheapest.items():
+            provider_clean = provider.replace('&', 'and').replace('<', '').replace('>', '')
+            story.append(Paragraph(f"{provider_clean[:50]}: ${price:,.0f}", normal_style))
+        story.append(Spacer(1, 0.1*inch))
+    
+    # Most Expensive Providers
+    if expensive:
+        story.append(Paragraph("Most Expensive Providers", heading_style))
+        for provider, price in expensive.items():
+            provider_clean = provider.replace('&', 'and').replace('<', '').replace('>', '')
+            story.append(Paragraph(f"{provider_clean[:50]}: ${price:,.0f}", normal_style))
+    
+    # Build PDF
+    doc.build(story)
+    return temp_file.name
+
 
 def main():
     st.title("🏥 CIGNA MA - In-Network Rates Dashboard")
@@ -180,10 +266,8 @@ def main():
         st.warning("⚠️ Please run the data extraction script first.")
         return
     
-    # محاسبه میانگین کل سیستم
     overall_avg = summary['mean_rate'].mean() if summary is not None else 0
     
-    # Sidebar
     with st.sidebar:
         st.header("📊 Statistics")
         if summary is not None:
@@ -191,11 +275,10 @@ def main():
             st.metric("Unique Billing Codes", f"{len(summary):,}")
             st.metric("System Avg Rate", f"${overall_avg:,.0f}")
     
-    # Tabs
     tab1, tab2, tab3, tab4 = st.tabs(["🔍 Search", "📊 Compare", "🏆 Top Codes", "💡 Best/Worst Providers"])
     
     # ============================================
-    # TAB 1: SEARCH (ENHANCED - MANUAL INPUT)
+    # TAB 1: SEARCH
     # ============================================
     with tab1:
         st.subheader("🔍 Search by Billing Code or Description")
@@ -234,9 +317,16 @@ def main():
                     mean_price = prices.mean()
                     median_price = prices.median()
                     
-                    # ========================================
-                    # BENCHMARK COMPARISON
-                    # ========================================
+                    current_stats = {
+                        'count': len(prices),
+                        'mean': mean_price,
+                        'median': median_price,
+                        'min': prices.min(),
+                        'max': prices.max(),
+                        'std': prices.std()
+                    }
+                    
+                    # Benchmark Comparison
                     st.markdown("### 📊 Benchmark Analysis")
                     col_bench1, col_bench2 = st.columns(2)
                     
@@ -249,13 +339,11 @@ def main():
                     
                     with col_bench2:
                         percentile_rank = (summary['mean_rate'] < mean_price).sum() / len(summary) * 100
-                        st.info(f"📈 This code is in the **{percentile_rank:.0f}th percentile** of all codes (higher = more expensive)")
+                        st.info(f"📈 This code is in the **{percentile_rank:.0f}th percentile** of all codes")
                     
                     st.markdown("---")
                     
-                    # ========================================
-                    # ANOMALY DETECTION
-                    # ========================================
+                    # Anomaly Detection
                     anomalies = detect_anomalies(prices)
                     if anomalies:
                         st.markdown("### 🚨 Price Anomaly Alert")
@@ -265,24 +353,44 @@ def main():
                             st.caption(f"... and {len(anomalies) - 5} more anomalies")
                         st.markdown("---")
                     
-                    # Price statistics
+                    # Statistics
                     col1, col2, col3, col4 = st.columns(4)
                     col1.metric("Count", f"{len(prices):,}")
                     col2.metric("Mean", f"${mean_price:,.0f}")
                     col3.metric("Median", f"${median_price:,.0f}")
                     col4.metric("Std", f"${prices.std():,.0f}")
                     
-                    # Price distribution plot
+                    # Plot
                     st.pyplot(plot_price_distribution(subset, search_code))
+                    
+                    # PDF Export
+                    st.markdown("---")
+                    st.markdown("### 📄 Export Report")
+                    
+                    cheapest, expensive, _ = get_best_worst_providers(subset, search_code)
+                    
+                    if st.button("📥 Download PDF Report", key="pdf_btn"):
+                        with st.spinner("Generating PDF report..."):
+                            pdf_path = create_pdf_report(search_code, current_stats, anomalies, cheapest, expensive, overall_avg)
+                            with open(pdf_path, "rb") as f:
+                                pdf_data = f.read()
+                            st.download_button(
+                                label="✅ Click to Download PDF",
+                                data=pdf_data,
+                                file_name=f"cigna_report_{search_code}.pdf",
+                                mime="application/pdf",
+                                key="download_pdf"
+                            )
+                            os.unlink(pdf_path)
                     
                     # Sample data
                     with st.expander("📊 View Sample Data (first 100 rows)"):
                         st.dataframe(subset[['provider_name', 'negotiated_rate', 'negotiated_type', 'description']].head(100))
                 else:
-                    st.error(f"❌ Code '{search_code}' not found in database")
-                    st.info(f"💡 Try one of these popular codes: `{', '.join(top_codes[:10])}`")
+                    st.error(f"❌ Code '{search_code}' not found")
+                    st.info(f"💡 Try: {', '.join(top_codes[:10])}")
         
-        else:  # Description search
+        else:
             st.info("💡 Search by description to find the billing code")
             descriptions = load_all_descriptions()
             if descriptions:
@@ -304,7 +412,6 @@ def main():
     # ============================================
     with tab2:
         st.subheader("📊 Compare Two Billing Codes")
-        
         st.info("💡 You can also type custom codes (e.g., 76805, 99213)")
         
         col1, col2 = st.columns(2)
@@ -331,8 +438,6 @@ def main():
             if not data1.empty and not data2.empty:
                 st.pyplot(plot_compare_codes(data1, data2, code1, code2))
                 
-                # Comparison stats
-                st.subheader("📈 Comparison Statistics")
                 stats1 = data1['negotiated_rate'].dropna()
                 stats2 = data2['negotiated_rate'].dropna()
                 
@@ -391,7 +496,7 @@ def main():
                 st.success(f"Results for code: **{final_code}** (Found {num_providers} providers)")
                 
                 if num_providers < 6:
-                    st.info(f"ℹ️ Only {num_providers} provider(s) found for this code. Showing cheapest only.")
+                    st.info(f"ℹ️ Only {num_providers} provider(s) found. Showing cheapest only.")
                 
                 col_a, col_b = st.columns(2)
                 
